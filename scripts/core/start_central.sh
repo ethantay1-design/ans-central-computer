@@ -829,6 +829,10 @@ append_explorer_log_args() {
     if [[ -n "$EXPLORER_TERMINAL_EVENT_LOG_MODE" ]]; then
         EXPLORER_ARGS+=(-p "terminal_event_log_mode:=${EXPLORER_TERMINAL_EVENT_LOG_MODE}")
     fi
+    # Off by default: pause a robot's goals while its link_watchdog retreats.
+    if [[ "${EXPLORER_PAUSE_ON_LINK_RETREAT:-false}" == true ]]; then
+        EXPLORER_ARGS+=(-p "pause_on_link_retreat:=true")
+    fi
 }
 
 start_map_merge_filtered() {

@@ -145,6 +145,11 @@ class RobotState:
     nav2_retrace_active: bool = False
     # First timestamp when nav2_retrace_active became True.
     nav2_retrace_since: float = 0.0
+    # True while /<robot>/link_retreat_active (link_watchdog) is true.
+    link_retreat_active: bool = False
+    # Last goal blacklisted because it was cancelled far from target.
+    last_cancel_blacklist_time: float = 0.0
+    last_cancel_blacklist_point: Optional[Tuple[float, float]] = None
     # Goal to preserve while robot is in lethal space; resent after recovery.
     held_goal_position: Optional[Tuple[float, float]] = None
     # Robot-side topic: RegulatedPurePursuitController "collision ahead" (debounced).
@@ -316,6 +321,29 @@ def detect_frontiers(
 
 def _dist(a: Tuple[float, float], b: Tuple[float, float]) -> float:
     return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def link_retreat_blocks_assignment(enabled: bool, retreat_active: bool) -> bool:
+    """True while the robot's link_watchdog is stopping or retreating."""
+    return bool(enabled and retreat_active)
+
+
+def cancel_blacklist_to_undo(
+    now: float,
+    cancel_time: float,
+    point: Optional[Tuple[float, float]],
+    window_sec: float,
+) -> Optional[Tuple[float, float]]:
+    """Point to un-blacklist when a retreat starts just after a cancel.
+
+    The watchdog cancels the goal and raises link_retreat_active in the same
+    tick, but the cancel result can reach central first and get blacklisted.
+    """
+    if point is None or cancel_time <= 0.0:
+        return None
+    if 0.0 <= now - cancel_time <= window_sec:
+        return point
+    return None
 
 
 def assign_frontiers(
@@ -629,6 +657,13 @@ class MultiRobotExplorer(Node):
         self.declare_parameter('lethal_retry_delay_sec', 0.5)
         self.declare_parameter('retrace_hold_enabled', True)
         self.declare_parameter('retrace_hold_max_sec', 30.0)
+        # Pause new goals for a robot while its link_watchdog stops or retreats
+        # (/<robot>/link_retreat_active), so explorer goals don't preempt the
+        # retreat. Off by default.
+        self.declare_parameter('pause_on_link_retreat', False)
+        self.declare_parameter(
+            'link_retreat_topic_pattern', '/{robot}/link_retreat_active')
+        self.declare_parameter('link_retreat_unblacklist_window_sec', 3.0)
         # Debounced Bool from turtlebot3_navigation2/nav2_controller_collision_watch.py
         self.declare_parameter(
             'nav2_collision_ahead_topic_pattern', '/{robot}/nav2_collision_ahead')
@@ -902,6 +937,15 @@ class MultiRobotExplorer(Node):
         self.retrace_hold_enabled = bool(
             self.get_parameter('retrace_hold_enabled').value
         )
+        self.pause_on_link_retreat = bool(
+            self.get_parameter('pause_on_link_retreat').value
+        )
+        self.link_retreat_topic_pattern = str(
+            self.get_parameter('link_retreat_topic_pattern').value
+        )
+        self.link_retreat_unblacklist_window_sec = float(
+            self.get_parameter('link_retreat_unblacklist_window_sec').value
+        )
         self.retrace_hold_max_sec = float(
             self.get_parameter('retrace_hold_max_sec').value
         )
@@ -1062,6 +1106,7 @@ class MultiRobotExplorer(Node):
         self.goal_pubs: Dict[str, object] = {}
         self.lethal_subs: Dict[str, object] = {}
         self.retrace_subs: Dict[str, object] = {}
+        self.link_retreat_subs: Dict[str, object] = {}
         self.collision_ahead_subs: Dict[str, object] = {}
         self.planner_state_subs: Dict[str, object] = {}
         self.paused: bool = False
@@ -1185,6 +1230,14 @@ class MultiRobotExplorer(Node):
                     lambda msg, rname=name: self._nav2_retrace_callback(msg, rname),
                     10,
                 )
+            if self.pause_on_link_retreat:
+                ltopic = self.link_retreat_topic_pattern.format(robot=name)
+                self.link_retreat_subs[name] = self.create_subscription(
+                    Bool,
+                    ltopic,
+                    lambda msg, rname=name: self._link_retreat_callback(msg, rname),
+                    10,
+                )
             if self.goal_arrival_probe_use_collision_ahead:
                 ctopic = self.nav2_collision_ahead_topic_pattern.format(
                     robot=name)
@@ -1231,6 +1284,7 @@ class MultiRobotExplorer(Node):
             f'retarget_opportunity={self.retarget_opportunity_enable}, '
             f'nav2_path_precheck={self.nav2_path_precheck_enable}, '
             f'retrace_hold={self.retrace_hold_enabled}, '
+            f'pause_on_link_retreat={self.pause_on_link_retreat}, '
             f'goal_arrival_probe={self.goal_arrival_probe_enable}, '
             f'collision_ahead_for_probe={self.goal_arrival_probe_use_collision_ahead}, '
             f'navigate_to_pose_wait_sec={self.navigate_to_pose_server_wait_sec:.1f}, '
@@ -2593,6 +2647,28 @@ class MultiRobotExplorer(Node):
             return
         rs.nav2_collision_ahead = bool(msg.data)
 
+    def _link_retreat_callback(self, msg: Bool, robot_name: str):
+        rs = self.robots.get(robot_name)
+        if rs is None:
+            return
+        active = bool(msg.data)
+        if active == rs.link_retreat_active:
+            return
+        rs.link_retreat_active = active
+        now = self.get_clock().now().nanoseconds / 1e9
+        if not active:
+            self.get_logger().info(f'[{rs.name}] link retreat cleared; resuming goals')
+            return
+        self.get_logger().warn(f'[{rs.name}] link retreat active; pausing new goals')
+        undo = cancel_blacklist_to_undo(
+            now, rs.last_cancel_blacklist_time, rs.last_cancel_blacklist_point,
+            self.link_retreat_unblacklist_window_sec)
+        if undo is not None and undo in rs.blacklist:
+            rs.blacklist.remove(undo)
+            self.get_logger().info(
+                f'[{rs.name}] un-blacklisted {undo}: cancelled by link_watchdog')
+        rs.last_cancel_blacklist_point = None
+
     def _nav2_retrace_callback(self, msg: Bool, robot_name: str):
         rs = self.robots.get(robot_name)
         if rs is None:
@@ -2620,6 +2696,9 @@ class MultiRobotExplorer(Node):
 
     def _robot_may_assign_now(self, rs: RobotState, now: float) -> bool:
         if self.retrace_hold_enabled and rs.nav2_retrace_active:
+            return False
+        if link_retreat_blocks_assignment(
+                self.pause_on_link_retreat, rs.link_retreat_active):
             return False
         return now >= rs.next_assign_allowed_time
 
@@ -4719,8 +4798,13 @@ class MultiRobotExplorer(Node):
                     and far_from_goal
                     and not (self.degraded_hold_enabled and rs.degraded_active)
                     and not self._should_skip_blacklist_due_to_lethal(rs)
+                    and not link_retreat_blocks_assignment(
+                        self.pause_on_link_retreat, rs.link_retreat_active)
                 )
                 if should_blacklist_cancel and rs.goal_position is not None:
+                    rs.last_cancel_blacklist_time = (
+                        self.get_clock().now().nanoseconds / 1e9)
+                    rs.last_cancel_blacklist_point = rs.goal_position
                     self.get_logger().warn(
                         f'[{rs.name}] Goal canceled far from target; blacklisting '
                         f'(reason={cancel_reason}, pose_dist_m={pose_dist}, '
