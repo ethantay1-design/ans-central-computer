@@ -20,6 +20,16 @@ fleet_bridge_contract:
       qos: "reliable_volatile"
       max_hz: 4.0
       purpose: "Robot-side escape state to avoid conflicting commands."
+    - topic: "/{robot}/wifi_quality"
+      msg_type: "std_msgs/msg/Float32"
+      qos: "reliable_volatile"
+      max_hz: 1.0
+      purpose: "Wi-Fi quality 0..1 for safe_node_planner.py (wifi_monitor.py)."
+    - topic: "/{robot}/link_retreat_active"
+      msg_type: "std_msgs/msg/Bool"
+      qos: "reliable_volatile"
+      max_hz: 4.0
+      purpose: "Robot is stopped or retreating after losing safe_node (link_watchdog.py)."
     - topic: "/{robot}/navigate_to_pose/_action/*"
       msg_type: "action status/feedback/result"
       qos: "default_action_qos"
@@ -39,6 +49,11 @@ fleet_bridge_contract:
       qos: "service_qos"
       max_hz: 0.5
       purpose: "Sparse supervisory cancellation."
+    - topic: "/{robot}/safe_node"
+      msg_type: "geometry_msgs/msg/PoseStamped"
+      qos: "reliable_volatile"
+      max_hz: 0.5
+      purpose: "Nearest safe node in {robot}/map; doubles as the link heartbeat."
 
   discouraged_cross_network_topics:
     - "/tf"

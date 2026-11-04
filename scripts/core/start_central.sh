@@ -11,6 +11,8 @@
 #      - relay /<robot>/map(_wire_z) -> /map for central consumers
 #   3. Map merge       (multi-robot only; skipped when one robot)
 #   4. Explorer        (detect frontiers, send Nav2 action goals)
+#   5. Safe-node planner (optional, off by default: --safe-node-planner or
+#      SAFE_NODE_PLANNER_ENABLE=true)
 #
 # Prerequisites:
 #   - shared_domain mode:
@@ -47,6 +49,7 @@ BRIDGE_CONFIG_GENERATOR="${WORKSPACE_DIR}/scripts/bridging/generate_domain_bridg
 GENERATED_BRIDGE_CONFIG_DIR="${WORKSPACE_DIR}/config/generated_domain_bridge"
 TF_RELAY_SCRIPT="${EXPLORE_SCRIPT_DIR}/tf_relay_multirobot.py"
 EXPLORER_SCRIPT="${EXPLORE_SCRIPT_DIR}/multi_robot_explorer.py"
+SAFE_NODE_PLANNER_SCRIPT="${EXPLORE_SCRIPT_DIR}/safe_node_planner.py"
 SINGLE_ROBOT_WORLD_TF_SCRIPT="${EXPLORE_SCRIPT_DIR}/single_robot_world_tf_bridge.py"
 SINGLE_ROBOT_MAP_RELAY_SCRIPT="${EXPLORE_SCRIPT_DIR}/single_robot_map_relay.py"
 ACTION_RELAY_SCRIPT="${WORKSPACE_DIR}/scripts/bridging/fleet_navigate_to_pose_service_relay.py"
@@ -162,10 +165,16 @@ while (($# > 0)); do
         -[bpic]*)
             SELECTION="${1#-}"
             ;;
+        --safe-node-planner)
+            SAFE_NODE_PLANNER_ENABLE=true
+            ;;
         -h|--help)
             cat <<'EOF'
 Usage:
-  ./scripts/core/start_central.sh [robot_filter] [--comms-mode <shared_domain|bridged_domains>] [--domain-id <id>]
+  ./scripts/core/start_central.sh [robot_filter] [--comms-mode <shared_domain|bridged_domains>] [--domain-id <id>] [--safe-node-planner]
+
+  --safe-node-planner   also start safe_node_planner.py (publishes /<robot>/safe_node
+                        and /<robot>/connection_risk). Same as SAFE_NODE_PLANNER_ENABLE=true.
 
 Examples:
   ./scripts/core/start_central.sh
@@ -245,6 +254,7 @@ echo ""
 # surfaced clearly. Override by setting EXPLORER_USE_GOAL_POSE_FALLBACK=true
 # before running this script if you need the legacy behaviour.
 EXPLORER_USE_GOAL_POSE_FALLBACK="${EXPLORER_USE_GOAL_POSE_FALLBACK:-false}"
+SAFE_NODE_PLANNER_ENABLE="${SAFE_NODE_PLANNER_ENABLE:-false}"
 EXPLORER_FREQUENCY_HZ="${EXPLORER_FREQUENCY_HZ:-}"
 EXPLORER_TERMINAL_SUMMARY_ENABLE="${EXPLORER_TERMINAL_SUMMARY_ENABLE:-}"
 EXPLORER_TERMINAL_SUMMARY_PERIOD_SEC="${EXPLORER_TERMINAL_SUMMARY_PERIOD_SEC:-}"
@@ -254,6 +264,7 @@ if is_clean_profile; then
 else
     echo "  Explorer fallback = use_pose_goal_fallback=${EXPLORER_USE_GOAL_POSE_FALLBACK}"
 fi
+echo "  Safe-node planner = ${SAFE_NODE_PLANNER_ENABLE}"
 if [[ -n "$EXPLORER_FREQUENCY_HZ" ]]; then
     echo "  Explorer frequency = ${EXPLORER_FREQUENCY_HZ} Hz (override)"
 elif ! is_clean_profile; then
@@ -298,10 +309,11 @@ ensure_no_central_stack_running() {
     local pattern_explorer="python3 .*multi_robot_explorer\\.py .*--params-file .*multi_robot_explorer\\.yaml"
     local pattern_domain_bridge="domain_bridge .*\\.domain_bridge\\.yaml"
     local pattern_action_relay="python3 .*fleet_navigate_to_pose_service_relay\\.py"
+    local pattern_safe_node="python3 .*safe_node_planner\\.py"
 
     # Collect matching PIDs + commands (skip the grep processes themselves).
     local existing
-    existing="$(ps aux | grep -E "$pattern_tf|$pattern_bridge|$pattern_map_relay|$pattern_explorer|$pattern_domain_bridge|$pattern_action_relay" | grep -v grep || true)"
+    existing="$(ps aux | grep -E "$pattern_tf|$pattern_bridge|$pattern_map_relay|$pattern_explorer|$pattern_domain_bridge|$pattern_action_relay|$pattern_safe_node" | grep -v grep || true)"
 
     if [[ -z "$existing" ]]; then
         return 0
@@ -386,7 +398,7 @@ ensure_no_central_stack_running() {
     # Give the OS a moment, then re-check.
     sleep 1
     local remaining
-    remaining="$(ps aux | grep -E "$pattern_tf|$pattern_bridge|$pattern_map_relay|$pattern_explorer|$pattern_domain_bridge|$pattern_action_relay" | grep -v grep || true)"
+    remaining="$(ps aux | grep -E "$pattern_tf|$pattern_bridge|$pattern_map_relay|$pattern_explorer|$pattern_domain_bridge|$pattern_action_relay|$pattern_safe_node" | grep -v grep || true)"
     if [[ -n "$remaining" ]]; then
         echo "WARNING: Some central processes still appear to be running:"
         echo "$remaining"
@@ -940,6 +952,20 @@ else
     fi
     append_explorer_log_args
     python3 "${EXPLORER_ARGS[@]}" &
+    PIDS+=($!)
+fi
+
+# ---- 4. Safe-node planner (optional) ----
+# Reads /map, /<robot>/wifi_quality and TF; publishes /<robot>/safe_node
+# (link heartbeat for the robot's link_watchdog.py) and /<robot>/connection_risk.
+if [[ "$SAFE_NODE_PLANNER_ENABLE" == "true" ]]; then
+    echo "[4] Starting safe-node planner..."
+    SAFE_NODE_ARGS=(-p "robot_names:=[${ROBOT_LIST_PARAM}]")
+    if ((${#SELECTED_ROBOTS[@]} == 1)); then
+        # Same map as the single-robot explorer (map -> <robot>/map is identity).
+        SAFE_NODE_ARGS+=(-p "map_topic:=/${SELECTED_ROBOTS[0]}/map")
+    fi
+    python3 "${SAFE_NODE_PLANNER_SCRIPT}" --ros-args "${SAFE_NODE_ARGS[@]}" &
     PIDS+=($!)
 fi
 

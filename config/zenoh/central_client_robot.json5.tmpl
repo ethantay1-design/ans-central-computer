@@ -21,6 +21,7 @@
       reliable_routes_blocking: false,
       allow: {
         publishers: [
+          "/__ROBOT__/safe_node",
           "/__ROBOT__/navigate_to_pose/_action/.*",
           "/__ROBOT__/compute_path_to_pose/_action/.*",
         ],
@@ -31,6 +32,8 @@
           "/__ROBOT__/tf_static_zenoh",
           "/__ROBOT__/nav2_collision_ahead",
           "/__ROBOT__/nav2_retrace_active",
+          "/__ROBOT__/wifi_quality",
+          "/__ROBOT__/link_retreat_active",
           "/__ROBOT__/navigate_to_pose/_action/.*",
           "/__ROBOT__/compute_path_to_pose/_action/.*",
         ],

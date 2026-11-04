@@ -1,0 +1,73 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Map
+      Name: Merged map (/map)
+      Enabled: true
+      Topic:
+        Value: /map
+        Durability Policy: Transient Local
+      Color Scheme: map
+      Alpha: 1
+      Draw Behind: true
+    - Class: rviz_default_plugins/Map
+      Name: Risk grid (/blinky/connection_risk_display)
+      Enabled: true
+      Topic:
+        Value: /blinky/connection_risk_display
+        Durability Policy: Transient Local
+      Color Scheme: costmap
+      Alpha: 0.7
+      Draw Behind: false
+    - Class: rviz_default_plugins/Path
+      Name: Driven path
+      Enabled: true
+      Topic:
+        Value: /blinky/driven_path
+      Color: 255; 255; 0
+      Line Style: Lines
+    - Class: rviz_default_plugins/TF
+      Name: Frames (map, blinky/map, Blinky)
+      Enabled: true
+      Show Names: true
+      Show Arrows: false
+      Marker Scale: 2
+    - Class: rviz_default_plugins/Pose
+      Name: Safe node
+      Enabled: true
+      Topic:
+        Value: /blinky/safe_node
+      Shape: Arrow
+      Color: 0; 255; 0
+      Shaft Length: 0.6
+      Shaft Radius: 0.08
+      Head Length: 0.3
+      Head Radius: 0.18
+    - Class: rviz_default_plugins/Marker
+      Name: Moving obstacle
+      Enabled: true
+      Topic:
+        Value: /blinky/moving_obstacle
+    - Class: rviz_default_plugins/Marker
+      Name: Access point
+      Enabled: true
+      Topic:
+        Value: /blinky/access_point
+        Durability Policy: Transient Local
+  Global Options:
+    Fixed Frame: map
+    Background Color: 48; 48; 48
+  Views:
+    Current:
+      Class: rviz_default_plugins/TopDownOrtho
+      Name: Current View
+      X: 6
+      Y: 4
+      Scale: 60
+      Angle: 0
+Window Geometry:
+  Width: 1400
+  Height: 900
