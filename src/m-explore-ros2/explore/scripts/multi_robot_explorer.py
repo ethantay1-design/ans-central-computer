@@ -150,6 +150,13 @@ class RobotState:
     # Last goal blacklisted because it was cancelled far from target.
     last_cancel_blacklist_time: float = 0.0
     last_cancel_blacklist_point: Optional[Tuple[float, float]] = None
+    # Stale-link hold: newest TF stamp seen for this robot, local time at which
+    # that stamp last advanced, whether the hold is active, and when data came
+    # back after the last stale period.
+    link_tf_stamp: float = 0.0
+    link_fresh_time: float = 0.0
+    stale_link_active: bool = False
+    stale_link_fresh_again_time: float = 0.0
     # Goal to preserve while robot is in lethal space; resent after recovery.
     held_goal_position: Optional[Tuple[float, float]] = None
     # Robot-side topic: RegulatedPurePursuitController "collision ahead" (debounced).
@@ -344,6 +351,55 @@ def cancel_blacklist_to_undo(
     if 0.0 <= now - cancel_time <= window_sec:
         return point
     return None
+
+
+def tf_freshness_update(
+    prev_stamp: float, prev_fresh_time: float, stamp: float, now: float,
+) -> Tuple[float, float]:
+    """Return (newest stamp, fresh time) after one TF lookup.
+
+    A "latest" TF lookup keeps returning the last stored transform after the
+    robot's /tf stops arriving, so a successful lookup says nothing about
+    freshness. The fresh time moves to now only when the stamp advanced.
+    Stamps are compared with each other, never with the local clock, so a
+    clock offset between robot and central does not matter.
+    """
+    if stamp > prev_stamp:
+        return stamp, now
+    return prev_stamp, prev_fresh_time
+
+
+def link_is_stale(
+    enabled: bool, now: float, last_fresh_time: float, after_sec: float,
+) -> bool:
+    """True when the robot's TF stamp has not advanced for after_sec.
+
+    False before the first fresh sample (startup is handled elsewhere).
+    """
+    if not enabled or last_fresh_time <= 0.0:
+        return False
+    return now - last_fresh_time > after_sec
+
+
+def link_resume_hold_active(
+    enabled: bool, now: float, fresh_again_time: float, holdoff_sec: float,
+) -> bool:
+    """True for holdoff_sec after the robot's data became fresh again.
+
+    Right after a link outage the Zenoh routes are re-created; a request sent
+    then can reach the robot twice, and a duplicate goal id aborts an rclcpp
+    action server ("Failed to accept new goal").
+    """
+    if not enabled or fresh_again_time <= 0.0 or holdoff_sec <= 0.0:
+        return False
+    return 0.0 <= now - fresh_again_time < holdoff_sec
+
+
+def stale_link_blocks_assignment(
+    enabled: bool, stale_active: bool, resume_hold: bool,
+) -> bool:
+    """True while the robot's data is stale or in the post-resume hold."""
+    return bool(enabled and (stale_active or resume_hold))
 
 
 def assign_frontiers(
@@ -664,6 +720,14 @@ class MultiRobotExplorer(Node):
         self.declare_parameter(
             'link_retreat_topic_pattern', '/{robot}/link_retreat_active')
         self.declare_parameter('link_retreat_unblacklist_window_sec', 3.0)
+        # Hold a robot while its TF stamp stops advancing (central hears
+        # nothing from it, e.g. a Zenoh outage): no stall-watchdog cancel, no
+        # new goals, no cancel-blacklist. After the data returns, wait
+        # stale_link_resume_holdoff_sec before sending new requests. Off by
+        # default.
+        self.declare_parameter('stale_link_hold', False)
+        self.declare_parameter('stale_link_after_sec', 3.0)
+        self.declare_parameter('stale_link_resume_holdoff_sec', 5.0)
         # Debounced Bool from turtlebot3_navigation2/nav2_controller_collision_watch.py
         self.declare_parameter(
             'nav2_collision_ahead_topic_pattern', '/{robot}/nav2_collision_ahead')
@@ -945,6 +1009,13 @@ class MultiRobotExplorer(Node):
         )
         self.link_retreat_unblacklist_window_sec = float(
             self.get_parameter('link_retreat_unblacklist_window_sec').value
+        )
+        self.stale_link_hold = bool(self.get_parameter('stale_link_hold').value)
+        self.stale_link_after_sec = float(
+            self.get_parameter('stale_link_after_sec').value
+        )
+        self.stale_link_resume_holdoff_sec = float(
+            self.get_parameter('stale_link_resume_holdoff_sec').value
         )
         self.retrace_hold_max_sec = float(
             self.get_parameter('retrace_hold_max_sec').value
@@ -1285,6 +1356,7 @@ class MultiRobotExplorer(Node):
             f'nav2_path_precheck={self.nav2_path_precheck_enable}, '
             f'retrace_hold={self.retrace_hold_enabled}, '
             f'pause_on_link_retreat={self.pause_on_link_retreat}, '
+            f'stale_link_hold={self.stale_link_hold}, '
             f'goal_arrival_probe={self.goal_arrival_probe_enable}, '
             f'collision_ahead_for_probe={self.goal_arrival_probe_use_collision_ahead}, '
             f'navigate_to_pose_wait_sec={self.navigate_to_pose_server_wait_sec:.1f}, '
@@ -1581,6 +1653,9 @@ class MultiRobotExplorer(Node):
         self._update_robot_positions()
 
         now = self.get_clock().now().nanoseconds / 1e9
+        if self.stale_link_hold:
+            for rs in self.robots.values():
+                self._update_stale_link_hold(rs, now)
         # Physical motion progress: update when TF pose displacement exceeds
         # threshold, regardless of whether motion is directly goal-seeking.
         for rs in self.robots.values():
@@ -1682,6 +1757,8 @@ class MultiRobotExplorer(Node):
             for rs in self.robots.values():
                 if not rs.goal_active or rs.goal_pending or rs.homing_active:
                     continue
+                if self.stale_link_hold and rs.stale_link_active:
+                    continue
                 if rs.goal_position is None or rs.position is None:
                     continue
                 if rs.arrival_probe_in_progress or rs.path_precheck_in_progress:
@@ -1723,6 +1800,10 @@ class MultiRobotExplorer(Node):
             if not rs.goal_active or rs.last_goal_time <= 0:
                 continue
             if self.degraded_hold_enabled and rs.degraded_active:
+                continue
+            if self.stale_link_hold and rs.stale_link_active:
+                # Pose is frozen because no data arrives, not because the
+                # robot is stuck.
                 continue
             if self.retrace_hold_enabled and rs.nav2_retrace_active:
                 hold_age = (
@@ -2252,6 +2333,12 @@ class MultiRobotExplorer(Node):
                 rs.yaw = math.atan2(siny_cosp, cosy_cosp)
                 rs.last_tf_update_time = now
                 rs.tf_stale_warned = False
+                stamp = (
+                    float(t.header.stamp.sec)
+                    + float(t.header.stamp.nanosec) * 1e-9
+                )
+                rs.link_tf_stamp, rs.link_fresh_time = tf_freshness_update(
+                    rs.link_tf_stamp, rs.link_fresh_time, stamp, now)
                 if self._explorer_planning_ready and rs.start_pose_xy is None:
                     rs.start_pose_xy = (
                         t.transform.translation.x,
@@ -2700,7 +2787,40 @@ class MultiRobotExplorer(Node):
         if link_retreat_blocks_assignment(
                 self.pause_on_link_retreat, rs.link_retreat_active):
             return False
+        if self._stale_link_blocks(rs, now):
+            return False
         return now >= rs.next_assign_allowed_time
+
+    def _stale_link_blocks(self, rs: RobotState, now: float) -> bool:
+        return stale_link_blocks_assignment(
+            self.stale_link_hold,
+            rs.stale_link_active,
+            link_resume_hold_active(
+                self.stale_link_hold, now, rs.stale_link_fresh_again_time,
+                self.stale_link_resume_holdoff_sec),
+        )
+
+    def _update_stale_link_hold(self, rs: RobotState, now: float) -> None:
+        stale = link_is_stale(
+            self.stale_link_hold, now, rs.link_fresh_time,
+            self.stale_link_after_sec)
+        if stale and not rs.stale_link_active:
+            rs.stale_link_active = True
+            self.get_logger().warn(
+                f'[{rs.name}] robot data stale (TF stamp unchanged for '
+                f'{now - rs.link_fresh_time:.1f}s); holding goals and stall checks')
+        elif not stale and rs.stale_link_active:
+            rs.stale_link_active = False
+            rs.stale_link_fresh_again_time = now
+            # Restart the motion/progress clocks so the stall watchdog does
+            # not fire at once on the old timestamps.
+            rs.last_motion_time = now
+            rs.last_progress_time = now
+            rs.last_motion_sample_pose = rs.position
+            rs.last_motion_sample_time = now
+            self.get_logger().info(
+                f'[{rs.name}] robot data fresh again; resuming in '
+                f'{self.stale_link_resume_holdoff_sec:.1f}s')
 
     def _goal_point_blacklisted(
         self, rs: RobotState, gx: float, gy: float
@@ -4800,6 +4920,8 @@ class MultiRobotExplorer(Node):
                     and not self._should_skip_blacklist_due_to_lethal(rs)
                     and not link_retreat_blocks_assignment(
                         self.pause_on_link_retreat, rs.link_retreat_active)
+                    and not self._stale_link_blocks(
+                        rs, self.get_clock().now().nanoseconds / 1e9)
                 )
                 if should_blacklist_cancel and rs.goal_position is not None:
                     rs.last_cancel_blacklist_time = (

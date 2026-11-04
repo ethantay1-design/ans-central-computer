@@ -833,6 +833,14 @@ append_explorer_log_args() {
     if [[ "${EXPLORER_PAUSE_ON_LINK_RETREAT:-false}" == true ]]; then
         EXPLORER_ARGS+=(-p "pause_on_link_retreat:=true")
     fi
+    # Off by default: hold a robot's goals and stall checks while its TF is
+    # stale, then wait EXPLORER_STALE_LINK_RESUME_HOLDOFF_SEC (default 5.0).
+    if [[ "${EXPLORER_STALE_LINK_HOLD:-false}" == true ]]; then
+        EXPLORER_ARGS+=(-p "stale_link_hold:=true")
+        if [[ -n "${EXPLORER_STALE_LINK_RESUME_HOLDOFF_SEC:-}" ]]; then
+            EXPLORER_ARGS+=(-p "stale_link_resume_holdoff_sec:=${EXPLORER_STALE_LINK_RESUME_HOLDOFF_SEC}")
+        fi
+    fi
 }
 
 start_map_merge_filtered() {
